@@ -1,97 +1,110 @@
-package org.cryptomator.common.vaults;
+package com.elderdrivers.riru.edxp._hooker.impl;
 
-import org.cryptomator.common.mountpoint.InvalidMountPointException;
-import org.cryptomator.common.mountpoint.MountPointChooser;
-import org.cryptomator.common.settings.VaultSettings;
-import org.cryptomator.common.settings.VolumeImpl;
-import org.cryptomator.cryptofs.CryptoFileSystem;
-import org.cryptomator.frontend.dokany.Mount;
-import org.cryptomator.frontend.dokany.MountFactory;
-import org.cryptomator.frontend.dokany.MountFailedException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import android.annotation.SuppressLint;
+import android.app.ActivityThread;
+import android.app.ContextImpl;
+import android.app.LoadedApk;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.pm.ApplicationInfo;
+import android.content.res.CompatibilityInfo;
+import android.content.res.XResources;
 
-import javax.inject.Inject;
-import javax.inject.Named;
-import java.util.concurrent.ExecutorService;
+import com.elderdrivers.riru.edxp.config.ConfigManager;
+import com.elderdrivers.riru.edxp.util.Hookers;
+import com.elderdrivers.riru.edxp.util.MetaDataReader;
+import com.elderdrivers.riru.edxp.util.Utils;
 
-public class DokanyVolume extends AbstractVolume {
+import java.io.File;
+import java.io.IOException;
+import java.util.Map;
 
-	private static final Logger LOG = LoggerFactory.getLogger(DokanyVolume.class);
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.XposedHelpers;
+import de.robv.android.xposed.XposedInit;
 
-	private static final String FS_TYPE_NAME = "CryptomatorFS";
+// normal process initialization (for new Activity, Service, BroadcastReceiver etc.)
+public class HandleBindApp extends XC_MethodHook {
 
-	private final VaultSettings vaultSettings;
-	private final MountFactory mountFactory;
+    @Override
+    protected void beforeHookedMethod(MethodHookParam param) {
+        try {
+            Hookers.logD("ActivityThread#handleBindApplication() starts");
+            ActivityThread activityThread = (ActivityThread) param.thisObject;
+            Object bindData = param.args[0];
+            final ApplicationInfo appInfo = (ApplicationInfo) XposedHelpers.getObjectField(bindData, "appInfo");
+            // save app process name here for later use
+            ConfigManager.appProcessName = (String) XposedHelpers.getObjectField(bindData, "processName");
+            String reportedPackageName = appInfo.packageName.equals("android") ? "system" : appInfo.packageName;
+            Utils.logD("processName=" + ConfigManager.appProcessName +
+                    ", packageName=" + reportedPackageName + ", appDataDir=" + ConfigManager.appDataDir);
 
-	private Mount mount;
+            ComponentName instrumentationName = (ComponentName) XposedHelpers.getObjectField(bindData, "instrumentationName");
+            if (instrumentationName != null) {
+                Hookers.logD("Instrumentation detected, disabling framework for");
+                XposedBridge.disableHooks = true;
+                return;
+            }
+            CompatibilityInfo compatInfo = (CompatibilityInfo) XposedHelpers.getObjectField(bindData, "compatInfo");
+            if (appInfo.sourceDir == null) {
+                return;
+            }
+            XposedHelpers.setObjectField(activityThread, "mBoundApplication", bindData);
+            XposedInit.loadedPackagesInProcess.add(reportedPackageName);
+            LoadedApk loadedApk = activityThread.getPackageInfoNoCheck(appInfo, compatInfo);
 
-	@Inject
-	public DokanyVolume(VaultSettings vaultSettings, ExecutorService executorService, @Named("orderedMountPointChoosers") Iterable<MountPointChooser> choosers) {
-		super(choosers);
-		this.vaultSettings = vaultSettings;
-		this.mountFactory = new MountFactory(executorService);
-	}
+            XResources.setPackageNameForResDir(appInfo.packageName, loadedApk.getResDir());
 
-	@Override
-	public VolumeImpl getImplementationType() {
-		return VolumeImpl.DOKANY;
-	}
+            String processName = (String) XposedHelpers.getObjectField(bindData, "processName");
 
-	@Override
-	public void mount(CryptoFileSystem fs, String mountFlags) throws InvalidMountPointException, VolumeException {
-		this.mountPoint = determineMountPoint();
-		try {
-			this.mount = mountFactory.mount(fs.getPath("/"), mountPoint, vaultSettings.mountName().get(), FS_TYPE_NAME, mountFlags.strip());
-		} catch (MountFailedException e) {
-			if (vaultSettings.getCustomMountPath().isPresent()) {
-				LOG.warn("Failed to mount vault into {}. Is this directory currently accessed by another process (e.g. Windows Explorer)?", mountPoint);
-			}
-			throw new VolumeException("Unable to mount Filesystem", e);
-		}
-	}
 
-	@Override
-	public void reveal(Revealer revealer) throws VolumeException {
-		try {
-			mount.reveal(revealer::reveal);
-		} catch (Exception e) {
-			throw new VolumeException(e);
-		}
-	}
+            boolean isModule = false;
+            int xposedminversion = -1;
+            boolean xposedsharedprefs = false;
+            try {
+                Map<String, Object> metaData = MetaDataReader.getMetaData(new File(appInfo.sourceDir));
+                isModule = metaData.containsKey("xposedmodule");
+                if (isModule) {
+                    Object minVersionRaw = metaData.get("xposedminversion");
+                    if (minVersionRaw instanceof Integer) {
+                        xposedminversion = (Integer) minVersionRaw;
+                    } else if (minVersionRaw instanceof String) {
+                        xposedminversion = MetaDataReader.extractIntPart((String) minVersionRaw);
+                    }
+                    xposedsharedprefs = metaData.containsKey("xposedsharedprefs");
+                }
+            } catch (NumberFormatException | IOException e) {
+                Hookers.logE("ApkParser fails", e);
+            }
 
-	@Override
-	public void unmount() throws VolumeException {
-		try {
-			mount.unmount();
-		} catch (IllegalStateException e) {
-			throw new VolumeException("Unmount Failed.", e);
-		}
-		cleanupMountPoint();
-	}
+            if (isModule && (xposedminversion > 92 || xposedsharedprefs)) {
+                Utils.logW("New modules detected, hook preferences");
+                XposedHelpers.findAndHookMethod(ContextImpl.class, "checkMode", int.class, new XC_MethodHook() {
+                    @SuppressWarnings("deprecation")
+                    @SuppressLint("WorldReadableFiles")
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        if (((int) param.args[0] & Context.MODE_WORLD_READABLE) != 0) {
+                            param.setThrowable(null);
+                        }
+                    }
+                });
+                XposedHelpers.findAndHookMethod(ContextImpl.class, "getPreferencesDir", new XC_MethodHook() {
+                    @SuppressLint({"SetWorldReadable", "WorldReadableFiles"})
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        param.setResult(new File(ConfigManager.getPrefsPath(appInfo.packageName)));
+                    }
+                });
+            }
+            LoadedApkGetCL hook = new LoadedApkGetCL(loadedApk, reportedPackageName,
+                    processName, true);
+            hook.setUnhook(XposedHelpers.findAndHookMethod(
+                    LoadedApk.class, "getClassLoader", hook));
 
-	@Override
-	public void unmountForced() {
-		mount.unmountForced();
-		cleanupMountPoint();
-	}
-
-	@Override
-	public boolean supportsForcedUnmount() {
-		return true;
-	}
-
-	@Override
-	public boolean isSupported() {
-		return DokanyVolume.isSupportedStatic();
-	}
-
-	@Override
-	public MountPointRequirement getMountPointRequirement() {
-		return MountPointRequirement.EMPTY_MOUNT_POINT;
-	}
-
-	public static boolean isSupportedStatic() {
-		return MountFactory.isApplicable();
-	}
+        } catch (Throwable t) {
+            Hookers.logE("error when hooking bindApp", t);
+        }
+    }
 }
