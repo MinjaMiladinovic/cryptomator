@@ -1,369 +1,786 @@
-/*******************************************************************************
- * Copyright (c) 2016, 2017 Sebastian Stenzel and others.
- * All rights reserved.
- * This program and the accompanying materials are made available under the terms of the accompanying LICENSE file.
+/*
+ * Copyright 2018 Confluent Inc.
  *
- * Contributors:
- *     Sebastian Stenzel - initial API and implementation
- *******************************************************************************/
-package org.cryptomator.common.vaults;
+ * Licensed under the Confluent Community License (the "License"); you may not use
+ * this file except in compliance with the License.  You may obtain a copy of the
+ * License at
+ *
+ * http://www.confluent.io/confluent-community-license
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OF ANY KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations under the License.
+ */
 
-import com.google.common.base.Strings;
-import org.apache.commons.lang3.SystemUtils;
-import org.cryptomator.common.mountpoint.InvalidMountPointException;
-import org.cryptomator.common.settings.VaultSettings;
-import org.cryptomator.common.vaults.Volume.VolumeException;
-import org.cryptomator.cryptofs.CryptoFileSystem;
-import org.cryptomator.cryptofs.CryptoFileSystemProperties;
-import org.cryptomator.cryptofs.CryptoFileSystemProperties.FileSystemFlags;
-import org.cryptomator.cryptofs.CryptoFileSystemProvider;
-import org.cryptomator.cryptofs.common.Constants;
-import org.cryptomator.cryptofs.common.FileSystemCapabilityChecker;
-import org.cryptomator.cryptolib.api.CryptoException;
-import org.cryptomator.cryptolib.api.InvalidPassphraseException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+package io.confluent.connect.jdbc.sink;
 
-import javax.inject.Inject;
-import javax.inject.Named;
-import javax.inject.Provider;
-import javafx.beans.Observable;
-import javafx.beans.binding.Bindings;
-import javafx.beans.binding.BooleanBinding;
-import javafx.beans.binding.StringBinding;
-import javafx.beans.property.BooleanProperty;
-import javafx.beans.property.ObjectProperty;
-import javafx.beans.property.SimpleBooleanProperty;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.sink.SinkRecord;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
+import org.mockito.Matchers;
+import org.mockito.Mockito;
+
 import java.io.IOException;
-import java.nio.file.NoSuchFileException;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.EnumSet;
-import java.util.Objects;
-import java.util.Optional;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicReference;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
 
-import static org.cryptomator.common.Constants.MASTERKEY_FILENAME;
+import io.confluent.connect.jdbc.dialect.DatabaseDialect;
+import io.confluent.connect.jdbc.dialect.DatabaseDialects;
+import io.confluent.connect.jdbc.dialect.SqliteDatabaseDialect;
+import io.confluent.connect.jdbc.sink.metadata.FieldsMetadata;
+import io.confluent.connect.jdbc.util.TableId;
 
-@PerVault
-public class Vault {
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
-	private static final Logger LOG = LoggerFactory.getLogger(Vault.class);
-	private static final Path HOME_DIR = Paths.get(SystemUtils.USER_HOME);
+public class BufferedRecordsTest {
 
-	private final VaultSettings vaultSettings;
-	private final Provider<Volume> volumeProvider;
-	private final StringBinding defaultMountFlags;
-	private final AtomicReference<CryptoFileSystem> cryptoFileSystem;
-	private final ObjectProperty<VaultState> state;
-	private final ObjectProperty<Exception> lastKnownException;
-	private final VaultStats stats;
-	private final StringBinding displayName;
-	private final StringBinding displayablePath;
-	private final BooleanBinding locked;
-	private final BooleanBinding processing;
-	private final BooleanBinding unlocked;
-	private final BooleanBinding missing;
-	private final BooleanBinding needsMigration;
-	private final BooleanBinding unknownError;
-	private final StringBinding accessPoint;
-	private final BooleanBinding accessPointPresent;
-	private final BooleanProperty showingStats;
+  private final SqliteHelper sqliteHelper = new SqliteHelper(getClass().getSimpleName());
 
-	private volatile Volume volume;
+  private Map<Object, Object> props;
 
-	@Inject
-	Vault(VaultSettings vaultSettings, Provider<Volume> volumeProvider, @DefaultMountFlags StringBinding defaultMountFlags, AtomicReference<CryptoFileSystem> cryptoFileSystem, ObjectProperty<VaultState> state, @Named("lastKnownException") ObjectProperty<Exception> lastKnownException, VaultStats stats) {
-		this.vaultSettings = vaultSettings;
-		this.volumeProvider = volumeProvider;
-		this.defaultMountFlags = defaultMountFlags;
-		this.cryptoFileSystem = cryptoFileSystem;
-		this.state = state;
-		this.lastKnownException = lastKnownException;
-		this.stats = stats;
-		this.displayName = Bindings.createStringBinding(this::getDisplayName, vaultSettings.displayName());
-		this.displayablePath = Bindings.createStringBinding(this::getDisplayablePath, vaultSettings.path());
-		this.locked = Bindings.createBooleanBinding(this::isLocked, state);
-		this.processing = Bindings.createBooleanBinding(this::isProcessing, state);
-		this.unlocked = Bindings.createBooleanBinding(this::isUnlocked, state);
-		this.missing = Bindings.createBooleanBinding(this::isMissing, state);
-		this.needsMigration = Bindings.createBooleanBinding(this::isNeedsMigration, state);
-		this.unknownError = Bindings.createBooleanBinding(this::isUnknownError, state);
-		this.accessPoint = Bindings.createStringBinding(this::getAccessPoint, state);
-		this.accessPointPresent = this.accessPoint.isNotEmpty();
-		this.showingStats = new SimpleBooleanProperty(false);
-	}
+  @Before
+  public void setUp() throws IOException, SQLException {
+    sqliteHelper.setUp();
+    props = new HashMap<>();
+    props.put("name", "my-connector");
+    props.put("connection.url", sqliteHelper.sqliteUri());
+    props.put("batch.size", 1000); // sufficiently high to not cause flushes due to buffer being full
+    // We don't manually create the table, so let the connector do it
+    props.put("auto.create", true);
+    // We use various schemas, so let the connector add missing columns
+    props.put("auto.evolve", true);
+  }
 
-	// ******************************************************************************
-	// Commands
-	// ********************************************************************************/
+  @After
+  public void tearDown() throws IOException, SQLException {
+    sqliteHelper.tearDown();
+  }
 
-	private CryptoFileSystem createCryptoFileSystem(CharSequence passphrase) throws NoSuchFileException, IOException, InvalidPassphraseException, CryptoException {
-		Set<FileSystemFlags> flags = EnumSet.noneOf(FileSystemFlags.class);
-		if (vaultSettings.usesReadOnlyMode().get()) {
-			flags.add(FileSystemFlags.READONLY);
-		}
-		if (!flags.contains(FileSystemFlags.READONLY) && vaultSettings.filenameLengthLimit().get() == -1) {
-			LOG.debug("Determining file name length limitations...");
-			int limit = new FileSystemCapabilityChecker().determineSupportedFileNameLength(getPath());
-			vaultSettings.filenameLengthLimit().set(limit);
-			LOG.info("Storing file name length limit of {}", limit);
-		}
-		assert vaultSettings.filenameLengthLimit().get() > 0;
-		CryptoFileSystemProperties fsProps = CryptoFileSystemProperties.cryptoFileSystemProperties() //
-				.withPassphrase(passphrase) //
-				.withFlags(flags) //
-				.withMasterkeyFilename(MASTERKEY_FILENAME) //
-				.withMaxPathLength(vaultSettings.filenameLengthLimit().get() + Constants.MAX_ADDITIONAL_PATH_LENGTH) //
-				.withMaxNameLength(vaultSettings.filenameLengthLimit().get()) //
-				.build();
-		return CryptoFileSystemProvider.newFileSystem(getPath(), fsProps);
-	}
+  @Test
+  public void correctBatching() throws SQLException {
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
 
-	private void destroyCryptoFileSystem() {
-		LOG.trace("Trying to close associated CryptoFS...");
-		CryptoFileSystem fs = cryptoFileSystem.getAndSet(null);
-		if (fs != null) {
-			try {
-				fs.close();
-			} catch (IOException e) {
-				LOG.error("Error closing file system.", e);
-			}
-		}
-	}
+    final String url = sqliteHelper.sqliteUri();
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+    final DbStructure dbStructure = new DbStructure(dbDialect);
 
-	public synchronized void unlock(CharSequence passphrase) throws CryptoException, IOException, VolumeException, InvalidMountPointException {
-		if (cryptoFileSystem.get() == null) {
-			CryptoFileSystem fs = createCryptoFileSystem(passphrase);
-			cryptoFileSystem.set(fs);
-			try {
-				volume = volumeProvider.get();
-				volume.mount(fs, getEffectiveMountFlags());
-			} catch (Exception e) {
-				destroyCryptoFileSystem();
-				throw e;
-			}
-		} else {
-			throw new IllegalStateException("Already unlocked.");
-		}
-	}
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
 
-	public synchronized void lock(boolean forced) throws VolumeException {
-		if (forced && volume.supportsForcedUnmount()) {
-			volume.unmountForced();
-		} else {
-			volume.unmount();
-		}
-		destroyCryptoFileSystem();
-	}
+    final Schema schemaA = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .build();
+    final Struct valueA = new Struct(schemaA)
+        .put("name", "cuba");
+    final SinkRecord recordA = new SinkRecord("dummy", 0, null, null, schemaA, valueA, 0);
 
-	public void reveal(Volume.Revealer vaultRevealer) throws VolumeException {
-		volume.reveal(vaultRevealer);
-	}
+    final Schema schemaB = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .field("age", Schema.OPTIONAL_INT32_SCHEMA)
+        .build();
+    final Struct valueB = new Struct(schemaB)
+        .put("name", "cuba")
+        .put("age", 4);
+    final SinkRecord recordB = new SinkRecord("dummy", 1, null, null, schemaB, valueB, 1);
 
-	// ******************************************************************************
-	// Observable Properties
-	// *******************************************************************************
+    // test records are batched correctly based on schema equality as records are added
+    //   (schemaA,schemaA,schemaA,schemaB,schemaA) -> ([schemaA,schemaA,schemaA],[schemaB],[schemaA])
 
-	public ObjectProperty<VaultState> stateProperty() {
-		return state;
-	}
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
 
-	public VaultState getState() {
-		return state.get();
-	}
+    assertEquals(Arrays.asList(recordA, recordA, recordA), buffer.add(recordB));
 
-	public void setState(VaultState value) {
-		state.setValue(value);
-	}
+    assertEquals(Collections.singletonList(recordB), buffer.add(recordA));
 
-	public ObjectProperty<Exception> lastKnownExceptionProperty() {
-		return lastKnownException;
-	}
+    assertEquals(Collections.singletonList(recordA), buffer.flush());
+  }
 
-	public Exception getLastKnownException() {
-		return lastKnownException.get();
-	}
+  @Test(expected = ConfigException.class)
+  public void configParsingFailsIfDeleteWithWrongPKMode() {
+    props.put("delete.enabled", true);
+    props.put("insert.mode", "upsert");
+    props.put("pk.mode", "kafka"); // wrong pk mode for deletes
+    new JdbcSinkConfig(props);
+  }
 
-	public void setLastKnownException(Exception e) {
-		lastKnownException.setValue(e);
-	}
+  @Test
+  public void insertThenDeleteInBatchNoFlush() throws SQLException {
+    props.put("delete.enabled", true);
+    props.put("insert.mode", "upsert");
+    props.put("pk.mode", "record_key");
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
 
-	public BooleanBinding lockedProperty() {
-		return locked;
-	}
+    final String url = sqliteHelper.sqliteUri();
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+    final DbStructure dbStructure = new DbStructure(dbDialect);
 
-	public boolean isLocked() {
-		return state.get() == VaultState.LOCKED;
-	}
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
 
-	public BooleanBinding processingProperty() {
-		return processing;
-	}
+    final Schema keySchemaA = SchemaBuilder.struct()
+        .field("id", Schema.INT64_SCHEMA)
+        .build();
+    final Schema valueSchemaA = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .build();
+    final Struct keyA = new Struct(keySchemaA)
+        .put("id", 1234L);
+    final Struct valueA = new Struct(valueSchemaA)
+        .put("name", "cuba");
+    final SinkRecord recordA = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, valueA, 0);
+    final SinkRecord recordADelete = new SinkRecord("dummy", 0, keySchemaA, keyA, null, null, 0);
 
-	public boolean isProcessing() {
-		return state.get() == VaultState.PROCESSING;
-	}
+    final Schema schemaB = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .field("age", Schema.OPTIONAL_INT32_SCHEMA)
+        .build();
+    final Struct valueB = new Struct(schemaB)
+        .put("name", "cuba")
+        .put("age", 4);
+    final SinkRecord recordB = new SinkRecord("dummy", 1, keySchemaA, keyA, schemaB, valueB, 1);
 
-	public BooleanBinding unlockedProperty() {
-		return unlocked;
-	}
+    // test records are batched correctly based on schema equality as records are added
+    //   (schemaA,schemaA,schemaA,schemaB,schemaA) -> ([schemaA,schemaA,schemaA],[schemaB],[schemaA])
 
-	public boolean isUnlocked() {
-		return state.get() == VaultState.UNLOCKED;
-	}
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
 
-	public BooleanBinding missingProperty() {
-		return missing;
-	}
+    // delete should not cause a flush (i.e. not treated as a schema change)
+    assertEquals(Collections.emptyList(), buffer.add(recordADelete));
 
-	public boolean isMissing() {
-		return state.get() == VaultState.MISSING;
-	}
+    // schema change should trigger flush
+    assertEquals(Arrays.asList(recordA, recordA, recordADelete), buffer.add(recordB));
 
-	public BooleanBinding needsMigrationProperty() {
-		return needsMigration;
-	}
+    // second schema change should trigger flush
+    assertEquals(Collections.singletonList(recordB), buffer.add(recordA));
 
-	public boolean isNeedsMigration() {
-		return state.get() == VaultState.NEEDS_MIGRATION;
-	}
+    assertEquals(Collections.singletonList(recordA), buffer.flush());
+  }
 
-	public BooleanBinding unknownErrorProperty() {
-		return unknownError;
-	}
+  @Test
+  public void insertThenTwoDeletesWithSchemaInBatchNoFlush() throws SQLException {
+	    props.put("delete.enabled", true);
+	    props.put("insert.mode", "upsert");
+	    props.put("pk.mode", "record_key");
+	    final JdbcSinkConfig config = new JdbcSinkConfig(props);
 
-	public boolean isUnknownError() {
-		return state.get() == VaultState.ERROR;
-	}
+	    final String url = sqliteHelper.sqliteUri();
+	    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+	    final DbStructure dbStructure = new DbStructure(dbDialect);
 
-	public StringBinding displayNameProperty() {
-		return displayName;
-	}
+	    final TableId tableId = new TableId(null, null, "dummy");
+	    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
 
-	public String getDisplayName() {
-		return vaultSettings.displayName().get();
-	}
+	    final Schema keySchemaA = SchemaBuilder.struct()
+	        .field("id", Schema.INT64_SCHEMA)
+	        .build();
+	    final Schema valueSchemaA = SchemaBuilder.struct()
+	        .field("name", Schema.STRING_SCHEMA)
+	        .build();
+	    final Struct keyA = new Struct(keySchemaA)
+	        .put("id", 1234L);
+	    final Struct valueA = new Struct(valueSchemaA)
+	        .put("name", "cuba");
+	    final SinkRecord recordA = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, valueA, 0);
+	    final SinkRecord recordADeleteWithSchema = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, null, 0);
+	    final SinkRecord recordADelete = new SinkRecord("dummy", 0, keySchemaA, keyA, null, null, 0);
 
-	public StringBinding accessPointProperty() {
-		return accessPoint;
-	}
+	    final Schema schemaB = SchemaBuilder.struct()
+	        .field("name", Schema.STRING_SCHEMA)
+	        .field("age", Schema.OPTIONAL_INT32_SCHEMA)
+	        .build();
+	    final Struct valueB = new Struct(schemaB)
+	        .put("name", "cuba")
+	        .put("age", 4);
+	    final SinkRecord recordB = new SinkRecord("dummy", 1, keySchemaA, keyA, schemaB, valueB, 1);
 
-	public String getAccessPoint() {
-		if (state.get() == VaultState.UNLOCKED) {
-			assert volume != null;
-			return volume.getMountPoint().orElse(Path.of("")).toString();
-		} else {
-			return "";
-		}
-	}
+	    // test records are batched correctly based on schema equality as records are added
+	    //   (schemaA,schemaA,schemaA,schemaB,schemaA) -> ([schemaA,schemaA,schemaA],[schemaB],[schemaA])
 
-	public BooleanBinding accessPointPresentProperty() {
-		return accessPointPresent;
-	}
+	    assertEquals(Collections.emptyList(), buffer.add(recordA));
+	    assertEquals(Collections.emptyList(), buffer.add(recordA));
 
-	public boolean isAccessPointPresent() {
-		return accessPointPresent.get();
-	}
+	    // delete should not cause a flush (i.e. not treated as a schema change)
+	    assertEquals(Collections.emptyList(), buffer.add(recordADeleteWithSchema));
 
-	public StringBinding displayablePathProperty() {
-		return displayablePath;
-	}
+	    // delete should not cause a flush (i.e. not treated as a schema change)
+	    assertEquals(Collections.emptyList(), buffer.add(recordADelete));
+	    
+	    // schema change and/or previous deletes should trigger flush
+	    assertEquals(Arrays.asList(recordA, recordA, recordADeleteWithSchema, recordADelete), buffer.add(recordB));
 
-	public String getDisplayablePath() {
-		Path p = vaultSettings.path().get();
-		if (p.startsWith(HOME_DIR)) {
-			Path relativePath = HOME_DIR.relativize(p);
-			String homePrefix = SystemUtils.IS_OS_WINDOWS ? "~\\" : "~/";
-			return homePrefix + relativePath.toString();
-		} else {
-			return p.toString();
-		}
-	}
+	    // second schema change should trigger flush
+	    assertEquals(Collections.singletonList(recordB), buffer.add(recordA));
 
-	public BooleanProperty showingStatsProperty() {
-		return showingStats;
-	}
+	    assertEquals(Collections.singletonList(recordA), buffer.flush());
+  }
+  
+  @Test
+  public void insertThenDeleteThenInsertInBatchFlush() throws SQLException {
+    props.put("delete.enabled", true);
+    props.put("insert.mode", "upsert");
+    props.put("pk.mode", "record_key");
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
 
-	public boolean isShowingStats() {
-		return accessPointPresent.get();
-	}
+    final String url = sqliteHelper.sqliteUri();
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+    final DbStructure dbStructure = new DbStructure(dbDialect);
+
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
+
+    final Schema keySchemaA = SchemaBuilder.struct()
+        .field("id", Schema.INT64_SCHEMA)
+        .build();
+    final Schema valueSchemaA = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .build();
+    final Struct keyA = new Struct(keySchemaA)
+        .put("id", 1234L);
+    final Struct valueA = new Struct(valueSchemaA)
+        .put("name", "cuba");
+    final SinkRecord recordA = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, valueA, 0);
+    final SinkRecord recordADelete = new SinkRecord("dummy", 0, keySchemaA, keyA, null, null, 0);
+
+    final Schema schemaB = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .field("age", Schema.OPTIONAL_INT32_SCHEMA)
+        .build();
+    final Struct valueB = new Struct(schemaB)
+        .put("name", "cuba")
+        .put("age", 4);
+    final SinkRecord recordB = new SinkRecord("dummy", 1, keySchemaA, keyA, schemaB, valueB, 1);
+
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
+
+    // delete should not cause a flush (i.e. not treated as a schema change)
+    assertEquals(Collections.emptyList(), buffer.add(recordADelete));
+
+    // insert after delete should flush to insure insert isn't lost in batching
+    assertEquals(Arrays.asList(recordA, recordA, recordADelete), buffer.add(recordA));
+
+    // schema change should trigger flush
+    assertEquals(Collections.singletonList(recordA), buffer.add(recordB));
+
+    // second schema change should trigger flush
+    assertEquals(Collections.singletonList(recordB), buffer.add(recordA));
+
+    assertEquals(Collections.singletonList(recordA), buffer.flush());
+  }
+
+  @Test
+  public void insertThenDeleteWithSchemaThenInsertInBatchFlush() throws SQLException {
+	    props.put("delete.enabled", true);
+	    props.put("insert.mode", "upsert");
+	    props.put("pk.mode", "record_key");
+	    final JdbcSinkConfig config = new JdbcSinkConfig(props);
+
+	    final String url = sqliteHelper.sqliteUri();
+	    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+	    final DbStructure dbStructure = new DbStructure(dbDialect);
+
+	    final TableId tableId = new TableId(null, null, "dummy");
+	    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
+
+	    final Schema keySchemaA = SchemaBuilder.struct()
+	        .field("id", Schema.INT64_SCHEMA)
+	        .build();
+	    final Schema valueSchemaA = SchemaBuilder.struct()
+	        .field("name", Schema.STRING_SCHEMA)
+	        .build();
+	    final Struct keyA = new Struct(keySchemaA)
+	        .put("id", 1234L);
+	    final Struct valueA = new Struct(valueSchemaA)
+	        .put("name", "cuba");
+	    final SinkRecord recordA = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, valueA, 0);
+	    final SinkRecord recordADeleteWithSchema = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, null, 0);
+
+	    final Schema schemaB = SchemaBuilder.struct()
+	        .field("name", Schema.STRING_SCHEMA)
+	        .field("age", Schema.OPTIONAL_INT32_SCHEMA)
+	        .build();
+	    final Struct valueB = new Struct(schemaB)
+	        .put("name", "cuba")
+	        .put("age", 4);
+	    final SinkRecord recordB = new SinkRecord("dummy", 1, keySchemaA, keyA, schemaB, valueB, 1);
+
+	    assertEquals(Collections.emptyList(), buffer.add(recordA));
+	    assertEquals(Collections.emptyList(), buffer.add(recordA));
+
+	    // delete should not cause a flush (i.e. not treated as a schema change)
+	    assertEquals(Collections.emptyList(), buffer.add(recordADeleteWithSchema));
+
+	    // insert after delete should flush to insure insert isn't lost in batching
+	    assertEquals(Arrays.asList(recordA, recordA, recordADeleteWithSchema), buffer.add(recordA));
+
+	    // schema change should trigger flush
+	    assertEquals(Collections.singletonList(recordA), buffer.add(recordB));
+
+	    // second schema change should trigger flush
+	    assertEquals(Collections.singletonList(recordB), buffer.add(recordA));
+
+	    assertEquals(Collections.singletonList(recordA), buffer.flush());
+  }
+  
+  @Test
+  public void testMultipleDeletesBatchedTogether() throws SQLException {
+    props.put("delete.enabled", true);
+    props.put("insert.mode", "upsert");
+    props.put("pk.mode", "record_key");
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
+
+    final String url = sqliteHelper.sqliteUri();
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+    final DbStructure dbStructure = new DbStructure(dbDialect);
+
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
+
+    final Schema keySchemaA = SchemaBuilder.struct()
+        .field("id", Schema.INT64_SCHEMA)
+        .build();
+    final Schema valueSchemaA = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .build();
+    final Struct keyA = new Struct(keySchemaA)
+        .put("id", 1234L);
+    final Struct valueA = new Struct(valueSchemaA)
+        .put("name", "cuba");
+    final SinkRecord recordA = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, valueA, 0);
+    final SinkRecord recordADelete = new SinkRecord("dummy", 0, keySchemaA, keyA, null, null, 0);
+
+    final Schema schemaB = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .field("age", Schema.OPTIONAL_INT32_SCHEMA)
+        .build();
+    final Struct valueB = new Struct(schemaB)
+        .put("name", "cuba")
+        .put("age", 4);
+    final SinkRecord recordB = new SinkRecord("dummy", 1, keySchemaA, keyA, schemaB, valueB, 1);
+    final SinkRecord recordBDelete = new SinkRecord("dummy", 1, keySchemaA, keyA, null, null, 1);
+
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
+
+    // schema change should trigger flush
+    assertEquals(Collections.singletonList(recordA), buffer.add(recordB));
+
+    // deletes should not cause a flush (i.e. not treated as a schema change)
+    assertEquals(Collections.emptyList(), buffer.add(recordADelete));
+    assertEquals(Collections.emptyList(), buffer.add(recordBDelete));
+
+    // insert after delete should flush to insure insert isn't lost in batching
+    assertEquals(Arrays.asList(recordB, recordADelete, recordBDelete), buffer.add(recordB));
+
+    assertEquals(Collections.singletonList(recordB), buffer.flush());
+  }
+
+  @Test
+  public void testMultipleDeletesWithSchemaBatchedTogether() throws SQLException {
+	    props.put("delete.enabled", true);
+	    props.put("insert.mode", "upsert");
+	    props.put("pk.mode", "record_key");
+	    final JdbcSinkConfig config = new JdbcSinkConfig(props);
+
+	    final String url = sqliteHelper.sqliteUri();
+	    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+	    final DbStructure dbStructure = new DbStructure(dbDialect);
+
+	    final TableId tableId = new TableId(null, null, "dummy");
+	    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
+
+	    final Schema keySchemaA = SchemaBuilder.struct()
+	        .field("id", Schema.INT64_SCHEMA)
+	        .build();
+	    final Schema valueSchemaA = SchemaBuilder.struct()
+	        .field("name", Schema.STRING_SCHEMA)
+	        .build();
+	    final Struct keyA = new Struct(keySchemaA)
+	        .put("id", 1234L);
+	    final Struct valueA = new Struct(valueSchemaA)
+	        .put("name", "cuba");
+	    final SinkRecord recordA = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, valueA, 0);
+	    final SinkRecord recordADeleteWithSchema = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, null, 0);
+
+	    final Schema schemaB = SchemaBuilder.struct()
+	        .field("name", Schema.STRING_SCHEMA)
+	        .field("age", Schema.OPTIONAL_INT32_SCHEMA)
+	        .build();
+	    final Struct valueB = new Struct(schemaB)
+	        .put("name", "cuba")
+	        .put("age", 4);
+	    final SinkRecord recordB = new SinkRecord("dummy", 1, keySchemaA, keyA, schemaB, valueB, 1);
+	    final SinkRecord recordBDeleteWithSchema = new SinkRecord("dummy", 1, keySchemaA, keyA, schemaB, null, 1);
+
+	    assertEquals(Collections.emptyList(), buffer.add(recordA));
+
+	    // schema change should trigger flush
+	    assertEquals(Collections.singletonList(recordA), buffer.add(recordB));
+
+	    // schema change should trigger flush
+	    assertEquals(Collections.singletonList(recordB), buffer.add(recordADeleteWithSchema));
+	    
+	    // schema change should trigger flush
+	    assertEquals(Collections.singletonList(recordADeleteWithSchema), buffer.add(recordBDeleteWithSchema));
+
+	    // insert after delete should flush to insure insert isn't lost in batching
+	    assertEquals(Collections.singletonList(recordBDeleteWithSchema), buffer.add(recordB));
+
+	    assertEquals(Collections.singletonList(recordB), buffer.flush());
+  }
+  
+  @Test
+  public void testFlushSuccessNoInfo() throws SQLException {
+    final String url = sqliteHelper.sqliteUri();
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
+
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+
+    int[] batchResponse = new int[2];
+    batchResponse[0] = Statement.SUCCESS_NO_INFO;
+    batchResponse[1] = Statement.SUCCESS_NO_INFO;
+
+    final DbStructure dbStructureMock = mock(DbStructure.class);
+    when(dbStructureMock.createOrAmendIfNecessary(Matchers.any(JdbcSinkConfig.class),
+                                                  Matchers.any(Connection.class),
+                                                  Matchers.any(TableId.class),
+                                                  Matchers.any(FieldsMetadata.class)))
+        .thenReturn(true);
+
+    PreparedStatement preparedStatementMock = mock(PreparedStatement.class);
+    when(preparedStatementMock.executeBatch()).thenReturn(batchResponse);
+
+    Connection connectionMock = mock(Connection.class);
+    when(connectionMock.prepareStatement(Matchers.anyString())).thenReturn(preparedStatementMock);
+
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect,
+                                                       dbStructureMock, connectionMock);
+
+    final Schema schemaA = SchemaBuilder.struct().field("name", Schema.STRING_SCHEMA).build();
+    final Struct valueA = new Struct(schemaA).put("name", "cuba");
+    final SinkRecord recordA = new SinkRecord("dummy", 0, null, null, schemaA, valueA, 0);
+    buffer.add(recordA);
+
+    final Schema schemaB = SchemaBuilder.struct().field("name", Schema.STRING_SCHEMA).build();
+    final Struct valueB = new Struct(schemaA).put("name", "cubb");
+    final SinkRecord recordB = new SinkRecord("dummy", 0, null, null, schemaB, valueB, 0);
+    buffer.add(recordB);
+    buffer.flush();
+
+  }
 
 
-	// ******************************************************************************
-	// Getter/Setter
-	// *******************************************************************************/
+  @Test
+  public void testInsertModeUpdate() throws SQLException {
+    final String url = sqliteHelper.sqliteUri();
+    props.put("insert.mode", "update");
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
 
-	public VaultStats getStats() {
-		return stats;
-	}
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+    assertTrue(dbDialect instanceof SqliteDatabaseDialect);
+    final DbStructure dbStructureMock = mock(DbStructure.class);
+    when(dbStructureMock.createOrAmendIfNecessary(Matchers.any(JdbcSinkConfig.class),
+                                                  Matchers.any(Connection.class),
+                                                  Matchers.any(TableId.class),
+                                                  Matchers.any(FieldsMetadata.class)))
+        .thenReturn(true);
 
-	public Observable[] observables() {
-		return new Observable[]{state};
-	}
+    final Connection connectionMock = mock(Connection.class);
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructureMock,
+            connectionMock);
 
-	public VaultSettings getVaultSettings() {
-		return vaultSettings;
-	}
+    final Schema schemaA = SchemaBuilder.struct().field("name", Schema.STRING_SCHEMA).build();
+    final Struct valueA = new Struct(schemaA).put("name", "cuba");
+    final SinkRecord recordA = new SinkRecord("dummy", 0, null, null, schemaA, valueA, 0);
+    buffer.add(recordA);
 
-	public Path getPath() {
-		return vaultSettings.path().getValue();
-	}
+    // Even though we're using the SQLite dialect, which uses backtick as the default quote
+    // character, the SQLite JDBC driver does return double quote as the quote characters.
+    Mockito.verify(
+        connectionMock,
+        Mockito.times(1)
+    ).prepareStatement(Matchers.eq("UPDATE \"dummy\" SET \"name\" = ?"));
 
-	public boolean isHavingCustomMountFlags() {
-		return !Strings.isNullOrEmpty(vaultSettings.mountFlags().get());
-	}
+  }
 
-	public StringBinding defaultMountFlagsProperty() {
-		return defaultMountFlags;
-	}
+  @Test
+  public void testAddRecordDeleteNotEnabledAndNonePkMode() throws SQLException {
+    props.put("pk.mode", "none");
 
-	public String getDefaultMountFlags() {
-		return defaultMountFlags.get();
-	}
+    // Delete is not enabled, so therefore require non-null value and value schema,
+    // but any combination of key and key schema works
+    assertValidRecord(true, true, true, true);
+    assertValidRecord(false, true, true, true);
+    assertValidRecord(true, false, true, true);
+    assertValidRecord(false, false, true, true);
 
-	public String getEffectiveMountFlags() {
-		String mountFlags = vaultSettings.mountFlags().get();
-		if (Strings.isNullOrEmpty(mountFlags)) {
-			return getDefaultMountFlags();
-		} else {
-			return mountFlags;
-		}
-	}
+    // Fail when null value
+    assertInvalidRecord(false, false, false, false, "with a null value and null value schema");
+    assertInvalidRecord(true, false, false, false, "with a null value and null value schema");
+    assertInvalidRecord(false, true, false, false, "with a null value and null value schema");
+    assertInvalidRecord(true, true, false, false, "with a null value and null value schema");
+    assertInvalidRecord(false, false, true, false, "with a null value and Struct value schema");
+    assertInvalidRecord(true, false, true, false, "with a null value and Struct value schema");
+    assertInvalidRecord(false, true, true, false, "with a null value and Struct value schema");
+    assertInvalidRecord(true, true, true, false, "with a null value and Struct value schema");
 
-	public void setCustomMountFlags(String mountFlags) {
-		vaultSettings.mountFlags().set(mountFlags);
-	}
+    // Fail when null value schema but non-null value
+    assertInvalidRecord(false, false, false, true, "with a Struct value and null value schema");
+    assertInvalidRecord(true, false, false, true, "with a Struct value and null value schema");
+    assertInvalidRecord(false, true, false, true, "with a Struct value and null value schema");
+    assertInvalidRecord(true, true, false, true, "with a Struct value and null value schema");
+  }
 
-	public String getId() {
-		return vaultSettings.getId();
-	}
+  @Test
+  public void testAddRecordDeleteNotEnabledAndRecordKeyPkMode() throws SQLException {
+    props.put("pk.mode", "record_key");
+    props.put("pk.fields", "id");
 
-	public Optional<Volume> getVolume() {
-		return Optional.ofNullable(this.volume);
-	}
+    // Delete is not enabled, so therefore require non-null key and values with schemas
+    assertValidRecord(true, true, true, true);
+    // Fail when ingesting tombstones
+    assertInvalidRecord(true, true, false, true, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(true, true, true, false, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(true, true, false, false, "with a non-null Struct value and non-null Struct schema");
 
-	// ******************************************************************************
-	// Hashcode / Equals
-	// *******************************************************************************/
+    // Fail when null key and null key schema
+    assertInvalidRecord(false, false, true, true, "with a null key and null key schema");
+    assertInvalidRecord(false, false, false, true, "with a null key and null key schema");
+    assertInvalidRecord(false, false, false, false, "with a null key and null key schema");
 
-	@Override
-	public int hashCode() {
-		return Objects.hash(vaultSettings);
-	}
+    // Fail when null key and non-null key schema
+    assertInvalidRecord(true, false, true, true, "with a null key and Struct key schema");
+    assertInvalidRecord(true, false, false, true, "with a null key and Struct key schema");
+    assertInvalidRecord(true, false, false, false, "with a null key and Struct key schema");
 
-	@Override
-	public boolean equals(Object obj) {
-		if (obj instanceof Vault && obj.getClass().equals(this.getClass())) {
-			final Vault other = (Vault) obj;
-			return Objects.equals(this.vaultSettings, other.vaultSettings);
-		} else {
-			return false;
-		}
-	}
+    // Fail when non-null key and null key schema
+    assertInvalidRecord(false, true, true, true, "with a Struct key and null key schema");
+    assertInvalidRecord(false, true, false, true, "with a Struct key and null key schema");
+    assertInvalidRecord(false, true, false, false, "with a Struct key and null key schema");
+  }
 
-	public boolean supportsForcedUnmount() {
-		return volume.supportsForcedUnmount();
-	}
+  @Test
+  public void testAddRecordDeleteNotEnabledAndRecordValuePkMode() throws SQLException {
+    props.put("pk.mode", "record_value");
+    props.put("pk.fields", "name");
+
+    // Delete is not enabled, so therefore require non-null value and value schema,
+    // but any combination of key and key schema works
+    assertValidRecord(true, true, true, true);
+    assertValidRecord(false, true, true, true);
+    assertValidRecord(true, false, true, true);
+    assertValidRecord(false, false, true, true);
+
+    // Fail when null value and null value schema
+    assertInvalidRecord(true, true, false, false, "with a null value and null value schema");
+    assertInvalidRecord(true, false, false, false, "with a null value and null value schema");
+    assertInvalidRecord(false, true, false, false, "with a null value and null value schema");
+    assertInvalidRecord(false, false, false, false, "with a null value and null value schema");
+
+    // Fail when null value and non-null value schema
+    assertInvalidRecord(true, true, true, false, "with a null value and Struct value schema");
+    assertInvalidRecord(true, false, true, false, "with a null value and Struct value schema");
+    assertInvalidRecord(false, true, true, false, "with a null value and Struct value schema");
+    assertInvalidRecord(false, false, true, false, "with a null value and Struct value schema");
+
+    // Fail when non-null value and null value schema
+    assertInvalidRecord(true, true, false, true, "with a Struct value and null value schema");
+    assertInvalidRecord(true, false, false, true, "with a Struct value and null value schema");
+    assertInvalidRecord(false, true, false, true, "with a Struct value and null value schema");
+    assertInvalidRecord(false, false, false, true, "with a Struct value and null value schema");
+  }
+
+  @Test
+  public void testAddRecordDeleteNotEnabledAndKafkaPkMode() throws SQLException {
+    props.put("pk.mode", "kafka");
+
+    // Delete is not enabled, so therefore allow all combinations of
+    // null and non-null key, key schema, value, and value schema
+    assertValidRecord(true, true, true, true);
+    assertValidRecord(false, true, true, true);
+    assertValidRecord(true, false, true, true);
+    assertValidRecord(false, false, true, true);
+
+    assertInvalidRecord(true, true, true, false, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(false, true, true, false, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(true, false, true, false, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(false, false, true, false, "with a non-null Struct value and non-null Struct schema");
+
+    assertInvalidRecord(true, true, false, true, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(false, true, false, true, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(true, false, false, true, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(false, false, false, true, "with a non-null Struct value and non-null Struct schema");
+
+    assertInvalidRecord(true, true, false, false, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(false, true, false, false, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(true, false, false, false, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(false, false, false, false, "with a non-null Struct value and non-null Struct schema");
+  }
+
+  @Test
+  public void testAddRecordDeleteEnabledAndNonePkMode() throws SQLException {
+    props.put("delete.enabled", true);
+    props.put("pk.mode", "none");
+    ConfigException e = assertThrows(ConfigException.class, () -> new JdbcSinkConfig(props));
+    assertEquals(
+        "Primary key mode must be 'record_key' when delete support is enabled",
+        e.getMessage()
+    );
+  }
+
+  @Test
+  public void testAddRecordDeleteEnabledAndRecordValuePkMode() throws SQLException {
+    props.put("delete.enabled", true);
+    props.put("pk.mode", "record_value");
+    props.put("pk.fields", "name");
+    ConfigException e = assertThrows(ConfigException.class, () -> new JdbcSinkConfig(props));
+    assertEquals(
+        "Primary key mode must be 'record_key' when delete support is enabled",
+        e.getMessage()
+    );
+  }
+
+  @Test
+  public void testAddRecordDeleteEnabledAndKafkaPkMode() throws SQLException {
+    props.put("delete.enabled", true);
+    props.put("pk.mode", "kafka");
+    ConfigException e = assertThrows(ConfigException.class, () -> new JdbcSinkConfig(props));
+    assertEquals(
+        "Primary key mode must be 'record_key' when delete support is enabled",
+        e.getMessage()
+    );
+  }
+
+  @Test
+  public void testAddRecordDeleteEnabledAndRecordKeyPkMode() throws SQLException {
+    // Enabling delete requires 'record_key' pk mode
+    props.put("delete.enabled", true);
+    props.put("pk.mode", "record_key");
+    props.put("pk.fields", "id");
+
+    // Non-null key schema and key, but with various combinations of value schema and value
+    assertValidRecord(true, true, true, true);
+    assertValidRecord(true, true, true, true);
+    assertValidRecord(true, true, false, false);
+    assertValidRecord(true, true, false, false);
+
+    // Invalid when null key and null key schema
+    assertInvalidRecord(false, false, true, true, "with a null key");
+    assertInvalidRecord(false, false, false, true, "with a null key");
+    assertInvalidRecord(false, false, true, false, "with a null key");
+    assertInvalidRecord(false, false, false, false, "with a null key");
+
+    // Invalid when null key and non-null key schema
+    assertInvalidRecord(true, false, true, true, "with a null key");
+    assertInvalidRecord(true, false, false, true, "with a null key");
+    assertInvalidRecord(true, false, true, false, "with a null key");
+    assertInvalidRecord(true, false, false, false, "with a null key");
+
+    // Invalid when non-null key and null key schema
+    assertInvalidRecord(false, true, true, true, "with a Struct key and null key schema");
+    assertInvalidRecord(false, true, false, true, "with a Struct key and null key schema");
+    assertInvalidRecord(false, true, true, true, "with a Struct key and null key schema");
+    assertInvalidRecord(false, true, false, false, "with a Struct key and null key schema");
+  }
+
+  protected SinkRecord generateRecord(
+      boolean includeKeySchema,
+      boolean includeKey,
+      boolean includeValueSchema,
+      boolean includeValue
+  ) {
+    Schema keySchema = SchemaBuilder.struct()
+                                      .field("id", Schema.INT32_SCHEMA)
+                                      .build();
+    Schema valueSchema = SchemaBuilder.struct()
+                                      .field("name", Schema.STRING_SCHEMA)
+                                      .build();
+    Schema keySchemaForRecord = includeKeySchema ? keySchema : null;
+    Schema valueSchemaForRecord = includeValueSchema ? valueSchema : null;
+    final Object key = includeKey ? new Struct(keySchema).put("id", 100) : null;
+    final Object valueA = includeValue ? new Struct(valueSchema).put("name", "cuba") : null;
+    return new SinkRecord("dummy", 0, keySchemaForRecord, key, valueSchemaForRecord, valueA, 0);
+  }
+
+  protected void assertInvalidRecord(
+      boolean includeKeySchema,
+      boolean includeKey,
+      boolean includeValueSchema,
+      boolean includeValue,
+      String errorMessageFragment
+  ) {
+    assertInvalidRecord(
+        generateRecord(includeKeySchema, includeKey, includeValueSchema, includeValue),
+        errorMessageFragment
+    );
+  }
+
+  protected void assertInvalidRecord(SinkRecord record, String errorMessageFragment) {
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
+
+    final String url = sqliteHelper.sqliteUri();
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+    final DbStructure dbStructure = new DbStructure(dbDialect);
+
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
+
+    ConnectException e = assertThrows(ConnectException.class, () -> {
+      buffer.add(record);
+      buffer.flush();
+    });
+    assertTrue(
+        "Unexpected message: " + e.getMessage(),
+        e.getMessage().contains(errorMessageFragment)
+    );
+  }
+
+  protected void assertValidRecord(
+      boolean includeKeySchema,
+      boolean includeKey,
+      boolean includeValueSchema,
+      boolean includeValue
+  ) throws SQLException {
+    assertValidRecord(
+        generateRecord(includeKeySchema, includeKey, includeValueSchema, includeValue)
+    );
+  }
+
+  protected void assertValidRecord(SinkRecord record) throws SQLException {
+    props.put("batch.size", 2);
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
+
+    final String url = sqliteHelper.sqliteUri();
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+    final DbStructure dbStructure = new DbStructure(dbDialect);
+
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
+
+    List<SinkRecord> flushed = buffer.add(record);
+    assertEquals(Collections.emptyList(), flushed);
+  }
 }
